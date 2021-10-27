@@ -20,6 +20,8 @@
 #  define md5_block_data_order md5_block_asm_data_order
 # elif defined(__sparc) || defined(__sparc__)
 #  define md5_block_data_order md5_block_asm_data_order
+# elif defined(__aarch64__)
+#  define md5_block_data_order ossl_md5_block_asm_data_order
 # endif
 #endif
 
