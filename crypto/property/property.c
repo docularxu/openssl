@@ -102,6 +102,48 @@ typedef struct ossl_global_properties_st {
 #endif
 } OSSL_GLOBAL_PROPERTIES;
 
+typedef struct lb_global_st {
+    const OSSL_CORE_HANDLE *handle;
+    /* Lock to protect the strategy_status from concurrent writing. */
+    CRYPTO_RWLOCK *lock;
+    /* load-balanceing parameters */
+    int strategy;
+    void *strategy_status;
+} LB_GLOBAL;
+
+static void *lb_strategy_ossl_ctx_new(OSSL_LIB_CTX *libctx)
+{
+    LB_GLOBAL *lgbl = OPENSSL_zalloc(sizeof(*lgbl));
+
+    if (lgbl == NULL)
+        return NULL;
+
+    lgbl->lock = CRYPTO_THREAD_lock_new();
+    if (lgbl->lock == NULL) {
+        OPENSSL_free(lgbl);
+        return NULL;
+    }
+
+    return lgbl;
+}
+
+static void lb_strategy_ossl_ctx_free(void *lgbl)
+{
+    LB_GLOBAL *gbl = lgbl;
+
+    if (gbl != NULL) {
+        CRYPTO_THREAD_lock_free(gbl->lock);
+        OPENSSL_free(gbl->strategy_status);
+        OPENSSL_free(gbl);
+    }
+}
+
+static const OSSL_LIB_CTX_METHOD lb_strategy_ossl_ctx_method = {
+    OSSL_LIB_CTX_METHOD_LOW_PRIORITY,           /* to avoid use-after-free */
+    lb_strategy_ossl_ctx_new,
+    lb_strategy_ossl_ctx_free,
+};
+
 static void ossl_method_cache_flush_alg(OSSL_METHOD_STORE *store,
                                         ALGORITHM *alg);
 static void ossl_method_cache_flush(OSSL_METHOD_STORE *store, int nid);
