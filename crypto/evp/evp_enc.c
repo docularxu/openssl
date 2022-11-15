@@ -15,9 +15,11 @@
 #include <assert.h>
 #include <openssl/evp.h>
 #include <openssl/err.h>
+#include <openssl/provider.h>
 #include <openssl/rand.h>
 #ifndef FIPS_MODULE
 # include <openssl/engine.h>
+# include "prov/provider_ctx.h"
 #endif
 #include <openssl/params.h>
 #include <openssl/core_names.h>
@@ -199,6 +201,45 @@ static int evp_cipher_init_internal(EVP_CIPHER_CTX *ctx,
         ctx->fetched_cipher = provciph;
 #endif
     }
+
+#if !defined(FIPS_MODULE)
+    /*
+     * in case of a loadbalance provider, fetch a real implementation from
+     * the underneath load_balancer libctx
+     */
+    if (ossl_provider_is_load_balancer(cipher->prov)) {
+        /* fetch from the child load_balancer libctx */
+        PROV_CTX *provctx;
+        EVP_CIPHER *lbcipher;
+
+        provctx = (PROV_CTX *)OSSL_PROVIDER_get0_provider_ctx(cipher->prov);
+        lbcipher = EVP_CIPHER_fetch(provctx->libctx,
+                                    cipher->nid != NID_undef ?
+                                        OBJ_nid2sn(cipher->nid) : "NULL",
+                                    NULL);
+        if (lbcipher == NULL) {
+            ERR_raise(ERR_LIB_EVP, EVP_R_INITIALIZATION_ERROR);
+            return 0;
+        }
+        cipher = lbcipher;
+        EVP_CIPHER_free(ctx->fetched_cipher);
+        /*
+         * copying to fetched_cipher so it laterly can be free'd
+         * by EVP_CIPHER_CTX_free()
+         */
+        ctx->fetched_cipher = lbcipher;
+        /*
+         * the incoming type (reqdigest) is from a dummy method by 'lbprov'.
+         * it can not provide proper response to function calls such as:
+         * EVP_MD_get_size(EVP_MD_CTX_get0_md(ctx)),
+         * EVP_MD_get0_name(EVP_MD_CTX_get0_md(ctx)),
+         * EVP_MD_get0_description(EVP_MD_CTX_get0_md(ctx)))
+         *
+         * set reqdigest to the actual fetched method to fix this.
+         */
+        /* TODO: need to remove ctx->reqdigest = type; */
+    }
+#endif
 
     if (cipher->prov != NULL) {
         if (!EVP_CIPHER_up_ref((EVP_CIPHER *)cipher)) {
