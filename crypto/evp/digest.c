@@ -14,6 +14,7 @@
 #include <openssl/objects.h>
 #include <openssl/evp.h>
 #include <openssl/ec.h>
+#include <openssl/provider.h>
 #ifndef FIPS_MODULE
 # include <openssl/engine.h>
 #endif
@@ -24,6 +25,7 @@
 #include "internal/core.h"
 #include "crypto/evp.h"
 #include "evp_local.h"
+#include "prov/provider_ctx.h"
 
 static void cleanup_old_md_data(EVP_MD_CTX *ctx, int force)
 {
@@ -258,6 +260,31 @@ static int evp_md_init_internal(EVP_MD_CTX *ctx, const EVP_MD *type,
         EVP_MD_free(ctx->fetched_digest);
         ctx->fetched_digest = provmd;
 #endif
+    }
+
+    /*
+     * in case of a loadbalance provider, fetch a real implementation from
+     * the underneath load_balancer libctx
+     */
+    if (strncmp(ossl_provider_name(type->prov),
+                                   PREFIX_LOAD_BALANCING_PROV_NAME,
+                                   sizeof(PREFIX_LOAD_BALANCING_PROV_NAME)) == 0) {
+        /* fetch from child load_balancer libctx */
+        PROV_CTX *provctx;
+        provctx = (PROV_CTX *)OSSL_PROVIDER_get0_provider_ctx(type->prov);
+
+        EVP_MD *lbmd = EVP_MD_fetch(provctx->libctx,
+                                    type->type != NID_undef ?
+                                                  OBJ_nid2sn(type->type) : "NULL",
+                                    NULL);
+        if (lbmd == NULL) {
+            ERR_raise(ERR_LIB_EVP, EVP_R_INITIALIZATION_ERROR);
+            return 0;
+        }
+        type = lbmd;
+        EVP_MD_free(ctx->fetched_digest);
+        ctx->fetched_digest = lbmd;
+        ctx->reqdigest = type;
     }
 
     if (ctx->algctx != NULL && ctx->digest != NULL && ctx->digest != type) {
