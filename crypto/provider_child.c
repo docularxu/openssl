@@ -15,6 +15,7 @@
 #include <openssl/evp.h>
 #include "internal/provider.h"
 #include "internal/cryptlib.h"
+#include "internal/core.h"
 #include "crypto/evp.h"
 
 DEFINE_STACK_OF(OSSL_PROVIDER)
@@ -112,6 +113,21 @@ static int provider_create_child_cb(const OSSL_CORE_HANDLE *prov, void *cbdata)
         return 0;
 
     provname = gbl->c_prov_name(prov);
+
+    /*
+     * skip the creation of a child for the loadbalance provider itself
+     * because no implementation in the loadbalance provider is real.
+     */
+    if ((strncmp(provname, PREFIX_LOAD_BALANCING_PROV_NAME,
+                 sizeof(PREFIX_LOAD_BALANCING_PROV_NAME)) == 0)
+        && ossl_lib_ctx_is_load_balancer(ctx)) {
+        /*
+         * mark as a succcess, otherwise
+         * ossl_provider_register_child_cb() fails
+         */
+        ret = 1;
+        goto err;   /* to unlock gbl->lock */
+    }
 
     /*
      * We're operating under a lock so we can store the "current" provider in

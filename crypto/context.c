@@ -42,6 +42,7 @@ struct ossl_lib_ctx_st {
     int run_once_ret[OSSL_LIB_CTX_MAX_RUN_ONCE];
     struct ossl_lib_ctx_onfree_list_st *onfreelist;
     unsigned int ischild:1;
+    unsigned int isloadbalancer:1;
 };
 
 int ossl_lib_ctx_write_lock(OSSL_LIB_CTX *ctx)
@@ -66,6 +67,15 @@ int ossl_lib_ctx_is_child(OSSL_LIB_CTX *ctx)
     if (ctx == NULL)
         return 0;
     return ctx->ischild;
+}
+
+int ossl_lib_ctx_is_load_balancer(OSSL_LIB_CTX *ctx)
+{
+    ctx = ossl_lib_ctx_get_concrete(ctx);
+
+    if (ctx == NULL)
+        return 0;
+    return ctx->isloadbalancer;
 }
 
 static int context_init(OSSL_LIB_CTX *ctx)
@@ -227,6 +237,24 @@ OSSL_LIB_CTX *OSSL_LIB_CTX_new_child(const OSSL_CORE_HANDLE *handle,
         return NULL;
     }
     ctx->ischild = 1;
+
+    return ctx;
+}
+
+OSSL_LIB_CTX *OSSL_LIB_CTX_new_load_balancer(const OSSL_CORE_HANDLE *handle,
+                                             const OSSL_DISPATCH *in,
+                                             int strategy)
+{
+    OSSL_LIB_CTX *ctx = OSSL_LIB_CTX_new_child(handle, in);
+
+    if (ctx == NULL)
+        return NULL;
+
+    if (!ossl_load_balancer_init(ctx, strategy)) {
+        OSSL_LIB_CTX_free(ctx);
+        return NULL;
+    }
+    ctx->isloadbalancer = 1;
 
     return ctx;
 }

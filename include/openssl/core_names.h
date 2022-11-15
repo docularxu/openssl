@@ -32,6 +32,9 @@ extern "C" {
 #define OSSL_PROV_PARAM_SELF_TEST_TYPE   "st-type"  /* utf8_string */
 #define OSSL_PROV_PARAM_SELF_TEST_DESC   "st-desc"  /* utf8_string */
 
+/* build-in load balance provider name */
+#define PREFIX_LOAD_BALANCING_PROV_NAME    "loadbalance"
+
 /*-
  * Provider-native object abstractions
  *
