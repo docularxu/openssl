@@ -5528,3 +5528,4 @@ OSSL_ERR_STATE_new                      ?	3_2_0	EXIST::FUNCTION:
 OSSL_ERR_STATE_save                     ?	3_2_0	EXIST::FUNCTION:
 OSSL_ERR_STATE_restore                  ?	3_2_0	EXIST::FUNCTION:
 OSSL_ERR_STATE_free                     ?	3_2_0	EXIST::FUNCTION:
+OSSL_LIB_CTX_new_load_balancer          ?	3_2_0	EXIST::FUNCTION:
