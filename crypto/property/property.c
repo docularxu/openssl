@@ -660,6 +660,13 @@ int ossl_method_store_fetch(OSSL_METHOD_STORE *store,
         return 0;
     }
 
+    /* does this belong to a load balancer libctx? */
+    if (ossl_lib_ctx_is_load_balancer(store->ctx)) {
+        ret = load_balancer_fetch_and_up_ref(store->ctx, alg->impls, method);
+        ossl_property_unlock(store);
+        return ret;
+    }
+
     if (prop_query != NULL)
         p2 = pq = ossl_parse_query(store->ctx, prop_query, 0);
     plp = ossl_ctx_global_properties(store->ctx, 0);
@@ -851,6 +858,13 @@ int ossl_method_store_cache_get(OSSL_METHOD_STORE *store, OSSL_PROVIDER *prov,
     alg = ossl_method_store_retrieve(store, nid);
     if (alg == NULL)
         goto err;
+
+    /* does this belong to a load balancer libctx? */
+    if (ossl_lib_ctx_is_load_balancer(store->ctx)) {
+        res = load_balancer_fetch_and_up_ref(store->ctx, alg->impls, method);
+        ossl_property_unlock(store);
+        return res;
+    }
 
     elem.query = prop_query;
     elem.provider = prov;
