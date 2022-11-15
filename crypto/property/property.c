@@ -111,6 +111,23 @@ typedef struct lb_global_st {
     void *strategy_status;
 } LB_GLOBAL;
 
+typedef struct {
+    /* index of the method selected last time, init to -1 */
+    int last_index;
+} LBS_ROUND_ROBIN_STATUS;
+
+static void *lb_sched_round_robin_new_status(void)
+{
+    LBS_ROUND_ROBIN_STATUS *rr_status;
+
+    rr_status = OPENSSL_malloc(sizeof(*rr_status));
+    if (rr_status == NULL)
+        return 0;
+
+    rr_status->last_index = -1;
+    return (void *)rr_status;
+}
+
 static void *lb_strategy_ossl_ctx_new(OSSL_LIB_CTX *libctx)
 {
     LB_GLOBAL *lgbl = OPENSSL_zalloc(sizeof(*lgbl));
@@ -281,6 +298,80 @@ static void alg_cleanup(ossl_uintmax_t idx, ALGORITHM *a, void *arg)
     }
     if (store != NULL)
         ossl_sa_ALGORITHM_set(store->algs, idx, NULL);
+}
+
+/* load-balancing scheduler function prototype */
+typedef int (lb_sched_fn)(STACK_OF(IMPLEMENTATION) *impls,
+                          void *status, void **method);
+/* forward declarations of available load balancing schedulers */
+static lb_sched_fn lb_sched_round_robin;
+
+static int lb_sched_round_robin(STACK_OF(IMPLEMENTATION) *impls,
+                                void *status,
+                                void **method)
+{
+    LBS_ROUND_ROBIN_STATUS *rr_status = (LBS_ROUND_ROBIN_STATUS *)status;
+    IMPLEMENTATION *impl;
+    int this_index;
+    int num;
+
+    if (rr_status == NULL)
+        return 0;
+
+    if ((num = sk_IMPLEMENTATION_num(impls)) <= 0)    /* empty or NULL */
+        return 0;
+
+    rr_status->last_index ++;
+    this_index = (rr_status->last_index >= num) ? 0 : rr_status->last_index;
+    rr_status->last_index = this_index;
+
+    impl = sk_IMPLEMENTATION_value(impls, this_index);
+    if (!ossl_method_up_ref(&impl->method))
+        return 0;
+
+    *method = impl->method.method;
+    return 1;
+}
+
+static int load_balancer_fetch_and_up_ref(OSSL_LIB_CTX *libctx,
+                                          STACK_OF(IMPLEMENTATION) *impls,
+                                          void **method)
+{
+    LB_GLOBAL *lgbl;
+    int ret = 0;
+
+    if ((lgbl = ossl_lib_ctx_get_data(libctx, OSSL_LIB_CTX_LB_STRATEGY_INDEX,
+                                      &lb_strategy_ossl_ctx_method)) == NULL)
+        return 0;
+
+    /* obtain the lock */
+    if (!CRYPTO_THREAD_write_lock(lgbl->lock))
+       return 0;
+
+    switch (lgbl->strategy) {
+    case LB_STRATEGY_ROUND_ROBIN:
+        ret = lb_sched_round_robin(impls, lgbl->strategy_status, method);
+        goto end;
+
+    #if 0   /* To-be-added */
+    case LB_STRATEGY_PRIORITY:
+        return lb_sched_priority(impls, lgbl->strategy_status, method);
+        goto end;
+    case LB_STRATEGY_FREE_BANDWIDTH:
+        return lb_sched_free_bandwidth(impls, lgbl->strategy_status, method);
+        goto end;
+    case LB_STRATEGY_PACKET_SIZE:
+        return lb_sched_packet_size(impls, lgbl->strategy_status, method);
+        goto end;
+    #endif
+
+    default:
+        goto end;
+    }
+
+end:
+    CRYPTO_THREAD_unlock(lgbl->lock);
+    return ret;
 }
 
 /*
