@@ -129,6 +129,26 @@ static void *lb_sched_round_robin_new_status(void)
     return (void *)rr_status;
 }
 
+typedef struct {
+    /* minimum threshold to be a good implementation */
+    int threshold;
+    /* index of the last good implementation whose free_bandwidth is large than threshold */
+    int last_good;
+} LBS_FREE_BANDWIDTH_STATUS;
+
+static void *lb_sched_free_bandwidth_new_status(void)
+{
+    LBS_FREE_BANDWIDTH_STATUS *fbw_status;
+
+    fbw_status = OPENSSL_malloc(sizeof(*fbw_status));
+    if (fbw_status == NULL)
+        return 0;
+
+    fbw_status->threshold = 5;
+    fbw_status->last_good = 0;
+    return (void *)fbw_status;
+}
+
 void *ossl_lb_strategy_ctx_new(OSSL_LIB_CTX *libctx)
 {
     LB_GLOBAL *lgbl = OPENSSL_zalloc(sizeof(*lgbl));
@@ -291,6 +311,7 @@ typedef IMPLEMENTATION *(lb_sched_fn)(STACK_OF(IMPLEMENTATION) *impls,
                                       void *status);
 /* forward declarations of available load balancing schedulers */
 static lb_sched_fn lb_sched_round_robin;
+static lb_sched_fn lb_sched_free_bandwidth;
 
 static IMPLEMENTATION *lb_sched_round_robin(STACK_OF(IMPLEMENTATION) *impls,
                                             void *status)
@@ -314,6 +335,50 @@ static IMPLEMENTATION *lb_sched_round_robin(STACK_OF(IMPLEMENTATION) *impls,
     return impl;
 }
 
+/*
+ * Free_bandwidth scheduler strategy:
+ *   Query each impl->provider's free_bandwidth, and return the first one whose
+ *   free_bandwidth is bigger than the 'threshold'.
+ *   If none qualifies, the final impl which is queried is returned.
+ *
+ *   NOTE: always start the capability query from the last good impl.
+ */
+static IMPLEMENTATION *lb_sched_free_bandwidth(STACK_OF(IMPLEMENTATION) *impls,
+                                               void *status)
+{
+    LBS_FREE_BANDWIDTH_STATUS *fbw_status = (LBS_FREE_BANDWIDTH_STATUS *)status;
+    IMPLEMENTATION *impl;
+    int num, free_bw;
+
+    if ((fbw_status == NULL)
+            || (num = sk_IMPLEMENTATION_num(impls)) <= 0)    /* empty or NULL */
+        return NULL;
+
+    for (int i = 0, start = fbw_status->last_good; i < num; i++) {
+        impl = sk_IMPLEMENTATION_value(impls, start);
+        /*
+         * reset free_bw to 0. Because if provider->get_capabilities() is NULL,
+         * free_bw will not be changed
+         */
+        free_bw = 0;
+        /*
+         * "f" is the key word for querying free_bandwidth
+         */
+        ossl_provider_get_capabilities(impl->provider, "f", NULL, &free_bw);
+        if (free_bw > fbw_status->threshold) {  /* stop at the first good impl, and return */
+            fbw_status->last_good = start;
+            return impl;
+        }
+        start = (start + 1) % num;
+    }
+
+    /*
+     * none impl has a better than threshold free_bandwidth, we return the final one
+     * and don't update fbw_status->last_good
+     */
+    return impl;
+}
+
 static IMPLEMENTATION *load_balancer_fetch(OSSL_LIB_CTX *libctx,
                                STACK_OF(IMPLEMENTATION) *impls)
 {
@@ -332,13 +397,13 @@ static IMPLEMENTATION *load_balancer_fetch(OSSL_LIB_CTX *libctx,
     case LB_STRATEGY_ROUND_ROBIN:
         impl = lb_sched_round_robin(impls, lgbl->strategy_status);
         goto end;
+    case LB_STRATEGY_FREE_BANDWIDTH:
+        impl = lb_sched_free_bandwidth(impls, lgbl->strategy_status);
+        goto end;
 
     #if 0   /* To-be-added */
     case LB_STRATEGY_PRIORITY:
         impl = lb_sched_priority(impls, lgbl->strategy_status);
-        goto end;
-    case LB_STRATEGY_FREE_BANDWIDTH:
-        impl = lb_sched_free_bandwidth(impls, lgbl->strategy_status);
         goto end;
     case LB_STRATEGY_PACKET_SIZE:
         impl = lb_sched_packet_size(impls, lgbl->strategy_status);
@@ -799,10 +864,13 @@ static void ossl_method_cache_flush_some(OSSL_METHOD_STORE *store)
         tsan_add(&global_seed, state.seed);
 }
 
+/*
+ * return: 1, success; 0, failure
+ */
 int ossl_load_balancer_init(OSSL_LIB_CTX *ctx, int strategy)
 {
     LB_GLOBAL *lgbl;
-    void *status;
+    void *status = NULL;
 
     /* initialize strategy */
     lgbl = ossl_lib_ctx_get_data(ctx, OSSL_LIB_CTX_LB_STRATEGY_INDEX);
@@ -812,19 +880,21 @@ int ossl_load_balancer_init(OSSL_LIB_CTX *ctx, int strategy)
     lgbl->strategy = strategy;
     switch (lgbl->strategy) {
     case LB_STRATEGY_ROUND_ROBIN:
-        if ((status = lb_sched_round_robin_new_status()) == NULL)
-            return 0;
-        lgbl->strategy_status = status;
-        return 1;
-    #if 0  /* to-be-added */
-    case LB_STRATEGY_PRIORITY:
+        status = lb_sched_round_robin_new_status();
+        break;
     case LB_STRATEGY_FREE_BANDWIDTH:
+        status = lb_sched_free_bandwidth_new_status();
+        break;
+    case LB_STRATEGY_PRIORITY:
     case LB_STRATEGY_PACKET_SIZE:
-    #endif
     default:
-        return 0;
+        break;
     }
-    return 0;
+
+    if (status == NULL)
+        return 0;
+    lgbl->strategy_status = status;
+    return 1;
 }
 
 int ossl_method_store_cache_get(OSSL_METHOD_STORE *store, OSSL_PROVIDER *prov,
