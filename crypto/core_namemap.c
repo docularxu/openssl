@@ -391,7 +391,11 @@ static void get_legacy_evp_names(int base_nid, int nid, const char *pem_name,
 
     if (nid != NID_undef) {
         num = ossl_namemap_add_name(arg, num, OBJ_nid2sn(nid));
+//         printf("in %s(), nid=%d, sn=%s, ossl_namemap_add_name() returned num: %d\n",
+//                    __func__, nid, OBJ_nid2sn(nid), num);
         num = ossl_namemap_add_name(arg, num, OBJ_nid2ln(nid));
+//        printf("in %s(), nid=%d, sn=%s, ossl_namemap_add_name() returned num: %d\n",
+//                    __func__, nid, OBJ_nid2ln(nid), num);
         if ((obj = OBJ_nid2obj(nid)) != NULL) {
             char txtoid[OSSL_MAX_NAME_SIZE];
 

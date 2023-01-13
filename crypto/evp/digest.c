@@ -943,19 +943,21 @@ static void set_legacy_nid(const char *name, void *vlegacy_nid)
 {
     int nid;
     int *legacy_nid = vlegacy_nid;
+//    printf("enter %s(), name=%s, vlegacy_nid=%d\n",
+//                __func__, name, *(int *)vlegacy_nid);
     /*
      * We use lowest level function to get the associated method, because
      * higher level functions such as EVP_get_digestbyname() have changed
      * to look at providers too.
      */
     const void *legacy_method = OBJ_NAME_get(name, OBJ_NAME_TYPE_MD_METH);
-
     if (*legacy_nid == -1)       /* We found a clash already */
         return;
 
     if (legacy_method == NULL)
         return;
     nid = EVP_MD_nid(legacy_method);
+//     printf("nid=EVP_MD_nid nid(legacy_method)=%d\n", nid);
     if (*legacy_nid != NID_undef && *legacy_nid != nid) {
         *legacy_nid = -1;
         return;
