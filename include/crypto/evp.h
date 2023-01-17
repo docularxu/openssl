@@ -945,6 +945,7 @@ int evp_mac_get_number(const EVP_MAC *mac);
 int evp_md_get_number(const EVP_MD *md);
 int evp_rand_get_number(const EVP_RAND *rand);
 int evp_signature_get_number(const EVP_SIGNATURE *signature);
+int evp_method_id_to_name_id(uint32_t method_id);
 
 int evp_pkey_decrypt_alloc(EVP_PKEY_CTX *ctx, unsigned char **outp,
                            size_t *outlenp, size_t expected_outlen,
