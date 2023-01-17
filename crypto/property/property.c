@@ -169,15 +169,17 @@ typedef struct {
      */
     CRYPTO_RWLOCK *rwlock;
 #if !defined(OPENSSL_NO_DEFAULT_THREAD_POOL)
+    OSSL_LIB_CTX *libctx;
     /*
      * following items are related to thread
      * lb_sched_update_free_bandwidth_fn()
      */
     CRYPTO_MUTEX *lock;
     CRYPTO_CONDVAR *condvar;
-    /* thread */
+    /* thread handle */
     void *handle;
-    OSSL_LIB_CTX *libctx;
+    /* flag to finalize */
+    unsigned int isfinalizing:1;
 #endif
 } LBS_FREE_BANDWIDTH_STATUS;
 
@@ -202,6 +204,7 @@ static void *lb_sched_free_bandwidth_new_status(OSSL_LIB_CTX *libctx)
         goto err;
 
 #if !defined(OPENSSL_NO_DEFAULT_THREAD_POOL)
+    fbw_status->isfinalizing = 0;
     /* thread-related initialization */
     if (((fbw_status->lock = ossl_crypto_mutex_new()) == NULL)
             || ((fbw_status->condvar = ossl_crypto_condvar_new()) == NULL)
@@ -224,6 +227,35 @@ err:
     CRYPTO_THREAD_lock_free(fbw_status->rwlock);
     OPENSSL_free(fbw_status);
     return NULL;
+}
+
+static void lb_sched_free_bandwidth_status_free(void * status)
+{
+    LBS_FREE_BANDWIDTH_STATUS *fbw_status;
+    CRYPTO_THREAD_RETVAL retval;
+
+    fbw_status = (LBS_FREE_BANDWIDTH_STATUS *)status;
+#if !defined(OPENSSL_NO_DEFAULT_THREAD_POOL)
+    fbw_status->isfinalizing = 1;
+    ossl_crypto_condvar_broadcast(fbw_status->condvar);
+    ossl_crypto_thread_join(fbw_status->handle, &retval);
+    ossl_crypto_thread_clean(fbw_status->handle);
+
+    ossl_crypto_condvar_free(&fbw_status->condvar);
+    ossl_crypto_mutex_free(&fbw_status->lock);
+#endif
+
+    /* free best_impls, sparse arrary */
+    if (!CRYPTO_THREAD_write_lock(fbw_status->rwlock)) {
+        ERR_raise(ERR_LIB_CRYPTO, ERR_R_OPERATION_FAIL);
+        return;
+    }
+    ossl_sa_LBS_NID_BEST_IMPL_free_leaves(fbw_status->best_impls);
+    CRYPTO_THREAD_unlock(fbw_status->rwlock);
+    /* free rwlock */
+    CRYPTO_THREAD_lock_free(fbw_status->rwlock);
+
+    return;
 }
 
 #if !defined(OPENSSL_NO_DEFAULT_THREAD_POOL)
@@ -313,6 +345,10 @@ static CRYPTO_THREAD_RETVAL lb_sched_update_free_bandwidth_fn(void *data)
         /* wait on trigger */
         ossl_crypto_condvar_wait(fbw_status->condvar, fbw_status->lock);
 
+        /* check isfinal flag */
+        if (fbw_status->isfinalizing == 1)
+            break;
+
         /* take rwlock since we are updating the fbw_status's best_impls */
         if (CRYPTO_THREAD_write_lock(fbw_status->rwlock) != 1)
             continue;
@@ -353,11 +389,25 @@ void ossl_lb_strategy_ctx_free(void *lgbl)
 {
     LB_GLOBAL *gbl = lgbl;
 
-    if (gbl != NULL) {
-        CRYPTO_THREAD_lock_free(gbl->lock);
-        OPENSSL_free(gbl->strategy_status);
-        OPENSSL_free(gbl);
+    if (gbl == NULL)
+        return;
+
+    switch (gbl->strategy) {
+    case LB_STRATEGY_ROUND_ROBIN:
+        break;
+    case LB_STRATEGY_FREE_BANDWIDTH:
+        lb_sched_free_bandwidth_status_free(gbl->strategy_status);
+        break;
+    case LB_STRATEGY_PRIORITY:
+    case LB_STRATEGY_PACKET_SIZE:
+    default:
+        break;
     }
+
+    CRYPTO_THREAD_lock_free(gbl->lock);
+    OPENSSL_free(gbl->strategy_status);
+    OPENSSL_free(gbl);
+    return;
 }
 
 static void ossl_method_cache_flush_alg(OSSL_METHOD_STORE *store,
