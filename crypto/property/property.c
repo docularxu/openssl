@@ -13,12 +13,17 @@
 #include <stdarg.h>
 #include <openssl/crypto.h>
 #include "internal/core.h"
+#include "internal/namemap.h"
 #include "internal/property.h"
 #include "internal/provider.h"
+#include "internal/thread.h"
+#include "internal/thread_arch.h"
 #include "internal/tsan_assist.h"
 #include "crypto/ctype.h"
+#include "crypto/evp.h"
 #include <openssl/lhash.h>
 #include <openssl/rand.h>
+#include <openssl/thread.h>
 #include "internal/thread_once.h"
 #include "crypto/lhash.h"
 #include "crypto/sparse_array.h"
@@ -42,6 +47,10 @@ typedef struct {
     const OSSL_PROVIDER *provider;
     OSSL_PROPERTY_LIST *properties;
     METHOD method;
+    /* TODO: double check, whether adding a free_bandwidth element
+     * into IMPLEMENTATION is necessary
+     */
+    int free_bandwidth;
 } IMPLEMENTATION;
 
 DEFINE_STACK_OF(IMPLEMENTATION)
@@ -129,25 +138,200 @@ static void *lb_sched_round_robin_new_status(void)
     return (void *)rr_status;
 }
 
+/* a structure to record the best implementation for a <nid> */
 typedef struct {
-    /* minimum threshold to be a good implementation */
+    int nid;
+    IMPLEMENTATION *best_impl;
     int threshold;
-    /* index of the last good implementation whose free_bandwidth is large than threshold */
-    int last_good;
+    int fetch_count;
+} LBS_NID_BEST_IMPL;
+#define FETCH_COUNT_TRIGGER (1024)
+
+/*
+ * define SA type for LBS_NID_BEST_IMPL, to be used by
+ * LBS_FREE_BANDWIDTH_STATUS
+ */
+DEFINE_SPARSE_ARRAY_OF(LBS_NID_BEST_IMPL);
+
+typedef struct {
+    /* to record the best implementation for each <nid> */
+    SPARSE_ARRAY_OF(LBS_NID_BEST_IMPL) *best_impls;
+    /*
+     * this lock is to protect the access to best_impls,
+     * because
+     *  1) a provider undload, and a impl can be removed
+     *     during the lbs bandwidth update;
+     *  2) lb_sched_free_bandwidth() reads best_impls;
+     *  3) lb_sched_free_bandwidth() writes best_impls when
+     *     a new nid comes in, and when updating writes
+     *     nid_best_impl->fetch_count;
+     *  4) thread lb_sched_update_free_bandwidth_fn() writes best_impls;
+     */
+    CRYPTO_RWLOCK *rwlock;
+#if !defined(OPENSSL_NO_DEFAULT_THREAD_POOL)
+    /*
+     * following items are related to thread
+     * lb_sched_update_free_bandwidth_fn()
+     */
+    CRYPTO_MUTEX *lock;
+    CRYPTO_CONDVAR *condvar;
+    /* thread */
+    void *handle;
+    OSSL_LIB_CTX *libctx;
+#endif
 } LBS_FREE_BANDWIDTH_STATUS;
 
-static void *lb_sched_free_bandwidth_new_status(void)
+/* forward declaration */
+#if !defined(OPENSSL_NO_DEFAULT_THREAD_POOL)
+static CRYPTO_THREAD_RETVAL lb_sched_update_free_bandwidth_fn(void *data);
+#endif
+
+#define DEFAULT_MINIMUM_FREE_BANDWIDTH  (5)
+#define COUNT_MAX_THREADS               (1) /* default max threads in the load-balance libctx */
+static void *lb_sched_free_bandwidth_new_status(OSSL_LIB_CTX *libctx)
 {
     LBS_FREE_BANDWIDTH_STATUS *fbw_status;
 
-    fbw_status = OPENSSL_malloc(sizeof(*fbw_status));
+    fbw_status = OPENSSL_zalloc(sizeof(*fbw_status));
     if (fbw_status == NULL)
-        return 0;
+        return NULL;
 
-    fbw_status->threshold = 5;
-    fbw_status->last_good = 0;
+    if ((fbw_status->best_impls = ossl_sa_LBS_NID_BEST_IMPL_new()) == NULL)
+        goto err;
+    if ((fbw_status->rwlock = CRYPTO_THREAD_lock_new()) == NULL)
+        goto err;
+
+#if !defined(OPENSSL_NO_DEFAULT_THREAD_POOL)
+    /* thread-related initialization */
+    if (((fbw_status->lock = ossl_crypto_mutex_new()) == NULL)
+            || ((fbw_status->condvar = ossl_crypto_condvar_new()) == NULL)
+            || ((OSSL_set_max_threads(libctx, COUNT_MAX_THREADS) == 0)))
+        goto err;
+    fbw_status->libctx = libctx;
+    fbw_status->handle = ossl_crypto_thread_start(libctx,
+                            lb_sched_update_free_bandwidth_fn, fbw_status);
+    if (fbw_status->handle == NULL)
+        goto err;
+#endif
+
     return (void *)fbw_status;
+err:
+#if !defined(OPENSSL_NO_DEFAULT_THREAD_POOL)
+    ossl_crypto_condvar_free(&fbw_status->condvar);
+    ossl_crypto_mutex_free(&fbw_status->lock);
+#endif
+    ossl_sa_LBS_NID_BEST_IMPL_free(fbw_status->best_impls);
+    CRYPTO_THREAD_lock_free(fbw_status->rwlock);
+    OPENSSL_free(fbw_status);
+    return NULL;
 }
+
+#if !defined(OPENSSL_NO_DEFAULT_THREAD_POOL)
+/*
+ * forward declaration
+ * functions are defined later in this file
+ */
+static __owur int ossl_property_read_lock(OSSL_METHOD_STORE *p);
+static ALGORITHM *ossl_method_store_retrieve(OSSL_METHOD_STORE *store, int nid);
+static int ossl_property_unlock(OSSL_METHOD_STORE *p);
+
+/*
+ * callback on each element of fbw_status->best_impls, indexed by
+ * nid_best_impl->nid
+ */
+static void impls_free_bandwidth_cb(ossl_uintmax_t idx,
+                                    LBS_NID_BEST_IMPL *nid_best_impl,
+                                    void *arg)
+{
+    LBS_FREE_BANDWIDTH_STATUS *fbw_status = arg;
+    OSSL_METHOD_STORE *store;
+    ALGORITHM *alg = NULL;
+    OSSL_NAMEMAP *namemap;
+    IMPLEMENTATION *impl, *curr_best_impl = NULL;
+    FREE_BANDWIDTH_QUERY fbw_query;
+    int num, curr_best_fbw = -1;
+
+    namemap = ossl_lib_ctx_get_data(fbw_status->libctx, OSSL_LIB_CTX_NAMEMAP_INDEX);
+    store = ossl_lib_ctx_get_data(fbw_status->libctx, OSSL_LIB_CTX_EVP_METHOD_STORE_INDEX);
+    if ((namemap == NULL) || (store == NULL)
+            || (!ossl_property_read_lock(store)))   /* require read lock for alg */
+        return;
+    alg = ossl_method_store_retrieve(store, nid_best_impl->nid);
+    if (alg == NULL)
+        goto fin;
+
+    /* from name_id to name string */
+    fbw_query.name = ossl_namemap_num2name(namemap,
+                            evp_method_id_to_name_id(nid_best_impl->nid),
+                            0);
+
+    num = sk_IMPLEMENTATION_num(alg->impls);
+
+    for (int i = 0; i < num; i++) {     /* check every impl */
+        impl = sk_IMPLEMENTATION_value(alg->impls, i);
+        fbw_query.free_bandwidth = 0;   /* reset before querying */
+        /*
+         * "f" is the key word for querying free_bandwidth
+         */
+        ossl_provider_get_capabilities(impl->provider, "f", NULL, &fbw_query);
+        /* update this impl's free_bandwidth */
+        /* TODO: double check, whether adding a free_bandwidth element
+         * into IMPLEMENTATION is necessary
+         */
+        impl->free_bandwidth = fbw_query.free_bandwidth;
+        /* update the so-far best_impl */
+        if (fbw_query.free_bandwidth > curr_best_fbw) {
+            curr_best_fbw = fbw_query.free_bandwidth;
+            curr_best_impl = impl;
+        }
+    }
+
+    nid_best_impl->best_impl = curr_best_impl;
+
+fin:
+    ossl_property_unlock(store);
+    return;
+}
+
+/* BUG: TODO:
+ *    The update_fbw thread is triggered by a specific <nid>, however
+ *    it updates all <nid>'s best_impls.
+ *  Expected behavior: only update the best_impl of the triggering <nid>'s
+ */
+/*
+ * main entry of the free bandwidth update thread
+ */
+static CRYPTO_THREAD_RETVAL lb_sched_update_free_bandwidth_fn(void *data)
+{
+    LBS_FREE_BANDWIDTH_STATUS *fbw_status;
+
+    fbw_status = (LBS_FREE_BANDWIDTH_STATUS *)data;
+    /* take the lock */
+    ossl_crypto_mutex_lock(fbw_status->lock);
+
+    while (1) {
+        /* wait on trigger */
+        ossl_crypto_condvar_wait(fbw_status->condvar, fbw_status->lock);
+
+        /* take rwlock since we are updating the fbw_status's best_impls */
+        if (CRYPTO_THREAD_write_lock(fbw_status->rwlock) != 1)
+            continue;
+        /*
+         * check each pair of <nid> + <impl>
+         * update its free_bw
+         */
+        ossl_sa_LBS_NID_BEST_IMPL_doall_arg(fbw_status->best_impls,
+                                            impls_free_bandwidth_cb,
+                                            fbw_status);
+        /* unlock */
+        CRYPTO_THREAD_unlock(fbw_status->rwlock);
+    }
+
+    /* release the lock */
+    ossl_crypto_mutex_unlock(fbw_status->lock);
+    return 1;
+}
+#endif
 
 void *ossl_lb_strategy_ctx_new(OSSL_LIB_CTX *libctx)
 {
@@ -308,13 +492,13 @@ static void alg_cleanup(ossl_uintmax_t idx, ALGORITHM *a, void *arg)
 
 /* load-balancing scheduler function prototype */
 typedef IMPLEMENTATION *(lb_sched_fn)(STACK_OF(IMPLEMENTATION) *impls,
-                                      void *status);
+                                      void *status, int nid);
 /* forward declarations of available load balancing schedulers */
 static lb_sched_fn lb_sched_round_robin;
 static lb_sched_fn lb_sched_free_bandwidth;
 
 static IMPLEMENTATION *lb_sched_round_robin(STACK_OF(IMPLEMENTATION) *impls,
-                                            void *status)
+                                            void *status, int nid)
 {
     LBS_ROUND_ROBIN_STATUS *rr_status = (LBS_ROUND_ROBIN_STATUS *)status;
     IMPLEMENTATION *impl;
@@ -337,22 +521,80 @@ static IMPLEMENTATION *lb_sched_round_robin(STACK_OF(IMPLEMENTATION) *impls,
 
 /*
  * Free_bandwidth scheduler strategy:
- *   Query each impl->provider's free_bandwidth, and return the first one whose
- *   free_bandwidth is bigger than the 'threshold'.
- *   If none qualifies, the final impl which is queried is returned.
- *
- *   NOTE: always start the capability query from the last good impl.
  */
 static IMPLEMENTATION *lb_sched_free_bandwidth(STACK_OF(IMPLEMENTATION) *impls,
-                                               void *status)
+                                               void *status, int nid)
 {
     LBS_FREE_BANDWIDTH_STATUS *fbw_status = (LBS_FREE_BANDWIDTH_STATUS *)status;
     IMPLEMENTATION *impl;
-    int num, free_bw;
+    int num;
+    LBS_NID_BEST_IMPL *nid_best_impl;
 
     if ((fbw_status == NULL)
             || (num = sk_IMPLEMENTATION_num(impls)) <= 0)    /* empty or NULL */
         return NULL;
+
+#if !defined(OPENSSL_NO_DEFAULT_THREAD_POOL)
+    if (!CRYPTO_THREAD_read_lock(fbw_status->rwlock))
+            return NULL;
+    nid_best_impl = ossl_sa_LBS_NID_BEST_IMPL_get(fbw_status->best_impls, nid);
+    CRYPTO_THREAD_unlock(fbw_status->rwlock);
+
+    if(nid_best_impl == NULL) {
+        /* the first time to fetch this nid, alloc it */
+        if ((nid_best_impl = OPENSSL_zalloc(sizeof(*nid_best_impl))) == NULL)
+            return NULL;
+
+        nid_best_impl->nid = nid;
+        nid_best_impl->best_impl = sk_IMPLEMENTATION_value(impls, 0);  /* todo: check that we are in protection of accessing impls */
+        nid_best_impl->threshold = DEFAULT_MINIMUM_FREE_BANDWIDTH;
+        nid_best_impl->fetch_count = 0;
+        /* insert */
+        if (!CRYPTO_THREAD_write_lock(fbw_status->rwlock)) {
+            OPENSSL_free(nid_best_impl);
+            return NULL;
+        }
+        if (ossl_sa_LBS_NID_BEST_IMPL_set(fbw_status->best_impls, nid, nid_best_impl) != 1) {
+            CRYPTO_THREAD_unlock(fbw_status->rwlock);
+            OPENSSL_free(nid_best_impl);
+            return NULL;
+        }
+        CRYPTO_THREAD_unlock(fbw_status->rwlock);
+        /* trigger an update in lb_sched_update_free_bandwidth_fn() */
+        ossl_crypto_condvar_broadcast(fbw_status->condvar);
+        /* here we return immediately */
+        return nid_best_impl->best_impl;
+    }
+
+    if (!CRYPTO_THREAD_write_lock(fbw_status->rwlock))
+        return NULL;
+    nid_best_impl->fetch_count ++;
+    /*
+     * to check wether or not to trigger an fbw_update
+     * in lb_sched_update_free_bandwidth_fn()
+     */
+    if (nid_best_impl->fetch_count % FETCH_COUNT_TRIGGER == 0)
+        ossl_crypto_condvar_broadcast(fbw_status->condvar);
+    CRYPTO_THREAD_unlock(fbw_status->rwlock);
+
+    return nid_best_impl->best_impl;
+#else
+    /*
+     * This is a slow path. When there is no thread pool, we will have to query
+     * free_bandwidth from each implemenatation one by one.
+     *
+     * Query each impl->provider's free_bandwidth, and return the first one whose
+     * free_bandwidth is bigger than the 'threshold'.
+     * If none qualifies, the final impl which is queried is returned.
+
+     * NOTE: always start the capability query from the last good impl.
+     */
+    /* TODO */
+    FREE_BANDWIDTH_QUERY fbw_query;
+    int free_bw;
+
+    fbw_query.name = nid;     /* todo: name */
+    fbw_query.free_bandwidth = 0;
 
     for (int i = 0, start = fbw_status->last_good; i < num; i++) {
         impl = sk_IMPLEMENTATION_value(impls, start);
@@ -364,13 +606,14 @@ static IMPLEMENTATION *lb_sched_free_bandwidth(STACK_OF(IMPLEMENTATION) *impls,
         /*
          * "f" is the key word for querying free_bandwidth
          */
-        ossl_provider_get_capabilities(impl->provider, "f", NULL, &free_bw);
+        ossl_provider_get_capabilities(impl->provider, "f", NULL, &fbw_query);
         if (free_bw > fbw_status->threshold) {  /* stop at the first good impl, and return */
             fbw_status->last_good = start;
             return impl;
         }
         start = (start + 1) % num;
     }
+#endif
 
     /*
      * none impl has a better than threshold free_bandwidth, we return the final one
@@ -380,7 +623,7 @@ static IMPLEMENTATION *lb_sched_free_bandwidth(STACK_OF(IMPLEMENTATION) *impls,
 }
 
 static IMPLEMENTATION *load_balancer_fetch(OSSL_LIB_CTX *libctx,
-                               STACK_OF(IMPLEMENTATION) *impls)
+                               STACK_OF(IMPLEMENTATION) *impls, int nid)
 {
     LB_GLOBAL *lgbl;
     IMPLEMENTATION *impl = NULL;
@@ -395,10 +638,10 @@ static IMPLEMENTATION *load_balancer_fetch(OSSL_LIB_CTX *libctx,
 
     switch (lgbl->strategy) {
     case LB_STRATEGY_ROUND_ROBIN:
-        impl = lb_sched_round_robin(impls, lgbl->strategy_status);
+        impl = lb_sched_round_robin(impls, lgbl->strategy_status, nid);
         goto end;
     case LB_STRATEGY_FREE_BANDWIDTH:
-        impl = lb_sched_free_bandwidth(impls, lgbl->strategy_status);
+        impl = lb_sched_free_bandwidth(impls, lgbl->strategy_status, nid);
         goto end;
 
     #if 0   /* To-be-added */
@@ -502,6 +745,7 @@ int ossl_method_store_add(OSSL_METHOD_STORE *store, const OSSL_PROVIDER *prov,
         return 0;
     }
     impl->provider = prov;
+    impl->free_bandwidth = 0;
 
     /* Insert into the hash table if required */
     if (!ossl_property_write_lock(store)) {
@@ -707,7 +951,7 @@ int ossl_method_store_fetch(OSSL_METHOD_STORE *store,
 
     /* does this belong to a load balancer libctx? */
     if (ossl_lib_ctx_is_load_balancer(store->ctx)) {
-        if ((impl = load_balancer_fetch(store->ctx, alg->impls)) != NULL
+        if ((impl = load_balancer_fetch(store->ctx, alg->impls, nid)) != NULL
                 && (prov == NULL || impl->provider == prov)) {
             best_impl = impl;
             ret = 1;
@@ -883,7 +1127,7 @@ int ossl_load_balancer_init(OSSL_LIB_CTX *ctx, int strategy)
         status = lb_sched_round_robin_new_status();
         break;
     case LB_STRATEGY_FREE_BANDWIDTH:
-        status = lb_sched_free_bandwidth_new_status();
+        status = lb_sched_free_bandwidth_new_status(ctx);
         break;
     case LB_STRATEGY_PRIORITY:
     case LB_STRATEGY_PACKET_SIZE:
@@ -916,7 +1160,7 @@ int ossl_method_store_cache_get(OSSL_METHOD_STORE *store, OSSL_PROVIDER *prov,
 
     /* does this belong to a load balancer libctx? */
     if (ossl_lib_ctx_is_load_balancer(store->ctx)) {
-        if ((impl = load_balancer_fetch(store->ctx, alg->impls)) != NULL
+        if ((impl = load_balancer_fetch(store->ctx, alg->impls, nid)) != NULL
                 && (prov == NULL || impl->provider == prov)
                 && (ossl_method_up_ref(&impl->method))) {
             *method = impl->method.method;
