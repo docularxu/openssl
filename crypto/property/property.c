@@ -229,6 +229,20 @@ err:
     return NULL;
 }
 
+/* forward decalration */
+static void ossl_method_free(METHOD *method);
+static int ossl_method_up_ref(METHOD *method);
+
+static void lb_sched_free_bandwidth_status_leaf_flush(ossl_uintmax_t idx,
+                                                      LBS_NID_BEST_IMPL *leaf)
+{
+    if (leaf->best_impl != NULL) {
+        ossl_method_free(&leaf->best_impl->method);
+        leaf->best_impl = NULL;
+    }
+    return;
+}
+
 static void lb_sched_free_bandwidth_status_free(void * status)
 {
     LBS_FREE_BANDWIDTH_STATUS *fbw_status;
@@ -250,11 +264,59 @@ static void lb_sched_free_bandwidth_status_free(void * status)
         ERR_raise(ERR_LIB_CRYPTO, ERR_R_OPERATION_FAIL);
         return;
     }
+    ossl_sa_LBS_NID_BEST_IMPL_doall(fbw_status->best_impls,
+                                    lb_sched_free_bandwidth_status_leaf_flush);
     ossl_sa_LBS_NID_BEST_IMPL_free_leaves(fbw_status->best_impls);
     CRYPTO_THREAD_unlock(fbw_status->rwlock);
     /* free rwlock */
     CRYPTO_THREAD_lock_free(fbw_status->rwlock);
 
+    return;
+}
+
+/*
+ * flush the impl <nid> 'cached' by free_bandwidth strategy status
+ */
+static void lb_sched_free_bandwidth_best_impl_flush(void *status, int nid)
+{
+    LBS_FREE_BANDWIDTH_STATUS *fbw_status = status;
+    LBS_NID_BEST_IMPL *nid_best_impl;
+
+#if !defined(OPENSSL_NO_DEFAULT_THREAD_POOL)
+    if (!CRYPTO_THREAD_write_lock(fbw_status->rwlock))
+        return;
+    nid_best_impl = ossl_sa_LBS_NID_BEST_IMPL_get(fbw_status->best_impls, nid);
+    if (nid_best_impl != NULL && nid_best_impl->best_impl != NULL) {
+        ossl_method_free(&nid_best_impl->best_impl->method);
+        nid_best_impl->best_impl = NULL;
+    }
+    CRYPTO_THREAD_unlock(fbw_status->rwlock);
+#endif
+    return;
+}
+
+/*
+ * This function flushes the impl 'cached' by load_balancing strategy. It's called
+ * when an impl being added or removed from the method_store.
+ */
+static void lb_sched_strategy_status_flush(OSSL_METHOD_STORE *store, int nid)
+{
+    LB_GLOBAL *lgbl;
+
+    lgbl = ossl_lib_ctx_get_data(store->ctx, OSSL_LIB_CTX_LB_STRATEGY_INDEX);
+    if (lgbl == NULL)
+        return;
+
+    switch (lgbl->strategy) {
+    case LB_STRATEGY_FREE_BANDWIDTH:
+        lb_sched_free_bandwidth_best_impl_flush(lgbl->strategy_status, nid);
+        break;
+    case LB_STRATEGY_ROUND_ROBIN:
+    case LB_STRATEGY_PRIORITY:
+    case LB_STRATEGY_PACKET_SIZE:
+    default:
+        break;
+    }
     return;
 }
 
@@ -318,7 +380,17 @@ static void impls_free_bandwidth_cb(ossl_uintmax_t idx,
         }
     }
 
+    if ((curr_best_impl == nid_best_impl->best_impl)
+        || (curr_best_impl == NULL))
+        goto fin;
+
+    /* free the old one */
+    if (nid_best_impl->best_impl != NULL)
+        ossl_method_free(&nid_best_impl->best_impl->method);
+
+    /* update nid_best_impl */
     nid_best_impl->best_impl = curr_best_impl;
+    ossl_method_up_ref(&curr_best_impl->method);
 
 fin:
     ossl_property_unlock(store);
@@ -531,6 +603,8 @@ static void alg_cleanup(ossl_uintmax_t idx, ALGORITHM *a, void *arg)
     OSSL_METHOD_STORE *store = arg;
 
     if (a != NULL) {
+        lb_sched_strategy_status_flush(store, a->nid);
+
         sk_IMPLEMENTATION_pop_free(a->impls, &impl_free);
         lh_QUERY_doall(a->cache, &impl_cache_free);
         lh_QUERY_free(a->cache);
@@ -596,7 +670,7 @@ static IMPLEMENTATION *lb_sched_free_bandwidth(STACK_OF(IMPLEMENTATION) *impls,
             return NULL;
 
         nid_best_impl->nid = nid;
-        nid_best_impl->best_impl = sk_IMPLEMENTATION_value(impls, 0);  /* todo: check that we are in protection of accessing impls */
+        nid_best_impl->best_impl = sk_IMPLEMENTATION_value(impls, 0);
         nid_best_impl->threshold = DEFAULT_MINIMUM_FREE_BANDWIDTH;
         nid_best_impl->fetch_count = 0;
         /* insert */
@@ -609,6 +683,8 @@ static IMPLEMENTATION *lb_sched_free_bandwidth(STACK_OF(IMPLEMENTATION) *impls,
             OPENSSL_free(nid_best_impl);
             return NULL;
         }
+        /* do up_ref() when it has been put into the SA successfully */
+        ossl_method_up_ref(&nid_best_impl->best_impl->method);
         CRYPTO_THREAD_unlock(fbw_status->rwlock);
         /* trigger an update in lb_sched_update_free_bandwidth_fn() */
         ossl_crypto_condvar_broadcast(fbw_status->condvar);
@@ -623,11 +699,13 @@ static IMPLEMENTATION *lb_sched_free_bandwidth(STACK_OF(IMPLEMENTATION) *impls,
      * to check wether or not to trigger an fbw_update
      * in lb_sched_update_free_bandwidth_fn()
      */
-    if (nid_best_impl->fetch_count % FETCH_COUNT_TRIGGER == 0)
+    if ((nid_best_impl->fetch_count % FETCH_COUNT_TRIGGER == 0)
+        || (nid_best_impl->best_impl == NULL))              /* nid flushed */
         ossl_crypto_condvar_broadcast(fbw_status->condvar);
     CRYPTO_THREAD_unlock(fbw_status->rwlock);
 
-    return nid_best_impl->best_impl;
+    return (nid_best_impl->best_impl == NULL) ?
+           sk_IMPLEMENTATION_value(impls, 0) : nid_best_impl->best_impl;
 #else
     /*
      * This is a slow path. When there is no thread pool, we will have to query
@@ -803,6 +881,8 @@ int ossl_method_store_add(OSSL_METHOD_STORE *store, const OSSL_PROVIDER *prov,
         return 0;
     }
     ossl_method_cache_flush(store, nid);
+    lb_sched_strategy_status_flush(store, nid);
+
     if ((impl->properties = ossl_prop_defn_get(store->ctx, properties)) == NULL) {
         impl->properties = ossl_parse_property(store->ctx, properties);
         if (impl->properties == NULL)
@@ -860,6 +940,8 @@ int ossl_method_store_remove(OSSL_METHOD_STORE *store, int nid,
     if (!ossl_property_write_lock(store))
         return 0;
     ossl_method_cache_flush(store, nid);
+    lb_sched_strategy_status_flush(store, nid);
+
     alg = ossl_method_store_retrieve(store, nid);
     if (alg == NULL) {
         ossl_property_unlock(store);
@@ -904,6 +986,8 @@ alg_cleanup_by_provider(ossl_uintmax_t idx, ALGORITHM *alg, void *arg)
         IMPLEMENTATION *impl = sk_IMPLEMENTATION_value(alg->impls, i);
 
         if (impl->provider == data->prov) {
+            lb_sched_strategy_status_flush(data->store, alg->nid);
+
             impl_free(impl);
             (void)sk_IMPLEMENTATION_delete(alg->impls, i);
             count++;
