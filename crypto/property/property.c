@@ -403,11 +403,6 @@ fin:
     return;
 }
 
-/* BUG: TODO:
- *    The update_fbw thread is triggered by a specific <nid>, however
- *    it updates all <nid>'s best_impls.
- *  Expected behavior: only update the best_impl of the triggering <nid>'s
- */
 /*
  * main entry of the free bandwidth update thread
  */
