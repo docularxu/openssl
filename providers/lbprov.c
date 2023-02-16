@@ -192,12 +192,15 @@ static int lbprov_get_params_from_core(OSSL_FUNC_core_get_params_fn *c_get_param
     return 1;
 }
 
+#ifdef STATIC_LBPROV
 OSSL_provider_init_fn ossl_lb_provider_init;
+# define OSSL_provider_init ossl_lb_provider_init
+#endif
 
-int ossl_lb_provider_init(const OSSL_CORE_HANDLE *handle,
-                          const OSSL_DISPATCH *in,
-                          const OSSL_DISPATCH **out,
-                          void **provctx)
+int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
+                       const OSSL_DISPATCH *in,
+                       const OSSL_DISPATCH **out,
+                       void **provctx)
 {
     OSSL_LIB_CTX *libctx = NULL;
     const OSSL_DISPATCH *tmp = in;

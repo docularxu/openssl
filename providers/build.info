@@ -74,8 +74,11 @@ DEPEND[$LIBDEFAULT]=$LIBCOMMON
 # by using the appropriate libraries as source).  Note that for shared
 # libraries, SOURCEd libraries are considered as if they were specified
 # with DEPEND.
-$LBGOAL=../libcrypto
-SOURCE[$LBGOAL]=lbprov.c
+$LBGOAL=loadbalance
+MODULES=$LBGOAL
+DEPEND[$LBGOAL]=$LIBCOMMON ../libcrypto
+INCLUDE[$LBGOAL]=.. $COMMON_INCLUDES
+SOURCE[$LBGOAL]=lbprov.c prov_running.c
 
 #
 # Default provider stuff
