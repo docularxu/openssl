@@ -20,7 +20,6 @@
 #include <openssl/proverr.h>
 #include "prov/names.h"
 #include "prov/providercommon.h"
-#include "prov/digestcommon.h"
 #include "prov/provider_ctx.h"
 
 /*
