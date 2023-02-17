@@ -110,9 +110,6 @@ typedef struct ossl_global_properties_st {
 
 typedef struct lb_global_st {
     const OSSL_CORE_HANDLE *handle;
-    /* Lock to protect the strategy_status from concurrent writing. */
-    CRYPTO_RWLOCK *lock;
-    /* load-balanceing parameters */
     int strategy;
     void *strategy_status;
 } LB_GLOBAL;
@@ -120,6 +117,7 @@ typedef struct lb_global_st {
 typedef struct {
     /* index of the method selected last time, init to -1 */
     int last_index;
+    CRYPTO_RWLOCK *rwlock;
 } LBS_ROUND_ROBIN_STATUS;
 
 static void *lb_sched_round_robin_new_status(void)
@@ -128,10 +126,23 @@ static void *lb_sched_round_robin_new_status(void)
 
     rr_status = OPENSSL_malloc(sizeof(*rr_status));
     if (rr_status == NULL)
-        return 0;
+        return NULL;
+
+    if ((rr_status->rwlock = CRYPTO_THREAD_lock_new()) == NULL) {
+        OPENSSL_free(rr_status);
+        return NULL;
+    }
 
     rr_status->last_index = -1;
     return (void *)rr_status;
+}
+
+static void lb_sched_round_robin_status_free(void *status)
+{
+    LBS_ROUND_ROBIN_STATUS *rr_status = status;
+    /* free rwlock */
+    CRYPTO_THREAD_lock_free(rr_status->rwlock);
+    return;
 }
 
 /* a structure to record the best implementation for a <nid> */
@@ -241,7 +252,7 @@ static void lb_sched_free_bandwidth_status_leaf_flush(ossl_uintmax_t idx,
     return;
 }
 
-static void lb_sched_free_bandwidth_status_free(void * status)
+static void lb_sched_free_bandwidth_status_free(void *status)
 {
     LBS_FREE_BANDWIDTH_STATUS *fbw_status;
     CRYPTO_THREAD_RETVAL retval;
@@ -445,16 +456,6 @@ static CRYPTO_THREAD_RETVAL lb_sched_update_free_bandwidth_fn(void *data)
 void *ossl_lb_strategy_ctx_new(OSSL_LIB_CTX *libctx)
 {
     LB_GLOBAL *lgbl = OPENSSL_zalloc(sizeof(*lgbl));
-
-    if (lgbl == NULL)
-        return NULL;
-
-    lgbl->lock = CRYPTO_THREAD_lock_new();
-    if (lgbl->lock == NULL) {
-        OPENSSL_free(lgbl);
-        return NULL;
-    }
-
     return lgbl;
 }
 
@@ -467,6 +468,7 @@ void ossl_lb_strategy_ctx_free(void *lgbl)
 
     switch (gbl->strategy) {
     case LB_STRATEGY_ROUND_ROBIN:
+        lb_sched_round_robin_status_free(gbl->strategy_status);
         break;
     case LB_STRATEGY_FREE_BANDWIDTH:
         lb_sched_free_bandwidth_status_free(gbl->strategy_status);
@@ -477,7 +479,6 @@ void ossl_lb_strategy_ctx_free(void *lgbl)
         break;
     }
 
-    CRYPTO_THREAD_lock_free(gbl->lock);
     OPENSSL_free(gbl->strategy_status);
     OPENSSL_free(gbl);
     return;
@@ -636,9 +637,14 @@ static IMPLEMENTATION *lb_sched_round_robin(STACK_OF(IMPLEMENTATION) *impls,
     if ((num = sk_IMPLEMENTATION_num(impls)) <= 0)    /* empty or NULL */
         return NULL;
 
+    /* get the rwlock, so it's safe to update last_index */
+    if (!CRYPTO_THREAD_write_lock(rr_status->rwlock))
+       return NULL;
+
     rr_status->last_index ++;
     this_index = (rr_status->last_index >= num) ? 0 : rr_status->last_index;
     rr_status->last_index = this_index;
+    CRYPTO_THREAD_unlock(rr_status->rwlock);
 
     impl = sk_IMPLEMENTATION_value(impls, this_index);
     return impl;
@@ -733,10 +739,6 @@ static IMPLEMENTATION *load_balancer_fetch(OSSL_LIB_CTX *libctx,
     if (lgbl == NULL)
         return NULL;
 
-    /* obtain the lock */
-    if (!CRYPTO_THREAD_write_lock(lgbl->lock))
-       return NULL;
-
     switch (lgbl->strategy) {
     case LB_STRATEGY_ROUND_ROBIN:
         impl = lb_sched_round_robin(impls, lgbl->strategy_status, nid);
@@ -759,7 +761,6 @@ static IMPLEMENTATION *load_balancer_fetch(OSSL_LIB_CTX *libctx,
     }
 
 end:
-    CRYPTO_THREAD_unlock(lgbl->lock);
     return impl;
 }
 
