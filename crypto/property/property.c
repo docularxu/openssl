@@ -681,7 +681,8 @@ static IMPLEMENTATION *lb_sched_free_bandwidth(STACK_OF(IMPLEMENTATION) *impls,
         nid_best_impl->nid = nid;
         nid_best_impl->best_impl = sk_IMPLEMENTATION_value(impls, 0);
         nid_best_impl->threshold = DEFAULT_MINIMUM_FREE_BANDWIDTH;
-        nid_best_impl->fetch_count = 1;
+        /* initialize fetch_count to the threshold to trigger an immediate update */
+        nid_best_impl->fetch_count = FETCH_COUNT_TRIGGER_THRESHOLD;
         /* insert */
         if (!CRYPTO_THREAD_write_lock(fbw_status->rwlock))
             goto err;
