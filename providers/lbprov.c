@@ -77,21 +77,25 @@ static int lbprov_get_params(void *provctx, OSSL_PARAM params[])
  */
 static int dummy_int_ret_err(void)
 {
+    printf("Enter %s()\n", __func__);
     return 0;
 }
 
 static int dummy_int_ret_succ(void)
 {
+    printf("Enter %s()\n", __func__);
     return 1;
 }
 
 static void *dummy_ptr_ret(void)
 {
+    printf("Enter %s()\n", __func__);
     return NULL;
 }
 
 static void dummy_void_ret(void)
 {
+    printf("Enter %s()\n", __func__);
     return;
 }
 
@@ -114,6 +118,34 @@ static const OSSL_ALGORITHM lbprov_digests[] = {
     ALG(PROV_NAMES_MD5, lbprov_dummy_md5_functions),
     { NULL, NULL, NULL }
 };
+
+#include <stdio.h>
+#include <execinfo.h>
+#include <stdlib.h>
+void print_call_stack() {
+    void* callstack[128];
+    int num_frames;
+    char** symbols;
+
+    // Get the call stack
+    num_frames = backtrace(callstack, sizeof(callstack) / sizeof(void*));
+
+    // Get the function names and addresses
+    symbols = backtrace_symbols(callstack, num_frames);
+
+    if (symbols) {
+        // Print the call stack
+        printf("Call Stack:\n");
+        for (int i = 0; i < num_frames; i++) {
+            printf("%s\n", symbols[i]);
+        }
+
+        // Free the memory allocated by backtrace_symbols
+        free(symbols);
+    } else {
+        printf("Error: Unable to obtain backtrace symbols.\n");
+    }
+}
 
 /* dummy function for cipher */
 # define IMPLEMENT_lbprov_dummy_cipher_func(alg, UCALG, lcmode, UCMODE,        \
