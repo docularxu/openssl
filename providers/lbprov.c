@@ -21,6 +21,9 @@
 #include "prov/names.h"
 #include "prov/providercommon.h"
 #include "prov/provider_ctx.h"
+#include "prov/provider_util.h"
+#include "prov/implementations.h"
+#include "internal/nelem.h"
 
 /*
  * Forward declarations to ensure that interface functions are correctly
@@ -87,11 +90,16 @@ static void *dummy_ptr_ret(void)
     return NULL;
 }
 
+static void dummy_void_ret(void)
+{
+    return;
+}
+
 static const OSSL_DISPATCH lbprov_dummy_md5_functions[] = {
     { OSSL_FUNC_DIGEST_NEWCTX,  (void (*)(void))dummy_ptr_ret },
     { OSSL_FUNC_DIGEST_UPDATE,  (void (*)(void))dummy_int_ret_err },
     { OSSL_FUNC_DIGEST_FINAL,   (void (*)(void))dummy_int_ret_err },
-    { OSSL_FUNC_DIGEST_FREECTX, (void (*)(void))dummy_ptr_ret },
+    { OSSL_FUNC_DIGEST_FREECTX, (void (*)(void))dummy_void_ret },
     { OSSL_FUNC_DIGEST_DUPCTX,  (void (*)(void))dummy_ptr_ret },
     { OSSL_FUNC_DIGEST_INIT,    (void (*)(void))dummy_int_ret_err },
     /*
@@ -107,7 +115,130 @@ static const OSSL_ALGORITHM lbprov_digests[] = {
     { NULL, NULL, NULL }
 };
 
+/* dummy function for cipher */
+# define IMPLEMENT_lbprov_dummy_cipher_func(alg, UCALG, lcmode, UCMODE,        \
+                                           flags, kbits, blkbits, ivbits, typ) \
+const OSSL_DISPATCH lbprov_dummy_##alg##kbits##lcmode##_functions[] = {        \
+    { OSSL_FUNC_CIPHER_NEWCTX,       (void (*)(void)) dummy_ptr_ret },         \
+    { OSSL_FUNC_CIPHER_FREECTX,      (void (*)(void)) dummy_void_ret },        \
+    { OSSL_FUNC_CIPHER_DUPCTX,       (void (*)(void)) dummy_ptr_ret },         \
+    { OSSL_FUNC_CIPHER_ENCRYPT_INIT, (void (*)(void)) dummy_int_ret_succ },    \
+    { OSSL_FUNC_CIPHER_DECRYPT_INIT, (void (*)(void)) dummy_int_ret_succ },    \
+    { OSSL_FUNC_CIPHER_UPDATE,       (void (*)(void)) dummy_int_ret_err },     \
+    { OSSL_FUNC_CIPHER_FINAL,        (void (*)(void)) dummy_int_ret_err },     \
+    { OSSL_FUNC_CIPHER_CIPHER,       (void (*)(void)) dummy_int_ret_err },     \
+    { OSSL_FUNC_CIPHER_GET_PARAMS,          (void (*)(void))dummy_int_ret_succ },   \
+    { OSSL_FUNC_CIPHER_GET_CTX_PARAMS,      (void (*)(void))dummy_int_ret_succ },   \
+    { OSSL_FUNC_CIPHER_SET_CTX_PARAMS,      (void (*)(void))dummy_int_ret_succ },   \
+    { OSSL_FUNC_CIPHER_GETTABLE_PARAMS,     (void (*)(void))dummy_ptr_ret },   \
+    { OSSL_FUNC_CIPHER_GETTABLE_CTX_PARAMS, (void (*)(void))dummy_ptr_ret },   \
+    { OSSL_FUNC_CIPHER_SETTABLE_CTX_PARAMS, (void (*)(void))dummy_ptr_ret },   \
+    OSSL_DISPATCH_END                                                          \
+};
+
+/*
+ * AES dummy
+ */
+/* lbprov_dummy_aes256ctr_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, ctr, CTR, 0, 256, 8, 128, stream)
+/* lbprov_dummy_aes192ctr_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, ctr, CTR, 0, 192, 8, 128, stream)
+/* lbprov_dummy_aes128ctr_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, ctr, CTR, 0, 128, 8, 128, stream)
+/* lbprov_dummy_aes256ecb_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, ecb, ECB, 0, 256, 128, 0, block)
+/* lbprov_dummy_aes192ecb_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, ecb, ECB, 0, 192, 128, 0, block)
+/* lbprov_dummy_aes128ecb_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, ecb, ECB, 0, 128, 128, 0, block)
+/* lbprov_dummy_aes256cbc_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, cbc, CBC, 0, 256, 128, 128, block)
+/* lbprov_dummy_aes192cbc_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, cbc, CBC, 0, 192, 128, 128, block)
+/* lbprov_dummy_aes128cbc_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, cbc, CBC, 0, 128, 128, 128, block)
+/* lbprov_dummy_aes256ofb_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, ofb, OFB, 0, 256, 8, 128, stream)
+/* lbprov_dummy_aes192ofb_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, ofb, OFB, 0, 192, 8, 128, stream)
+/* lbprov_dummy_aes128ofb_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, ofb, OFB, 0, 128, 8, 128, stream)
+/* lbprov_dummy_aes256cfb_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, cfb,  CFB, 0, 256, 8, 128, stream)
+/* lbprov_dummy_aes192cfb_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, cfb,  CFB, 0, 192, 8, 128, stream)
+/* lbprov_dummy_aes128cfb_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, cfb,  CFB, 0, 128, 8, 128, stream)
+/* lbprov_dummy_aes256cfb1_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, cfb1, CFB, 0, 256, 8, 128, stream)
+/* lbprov_dummy_aes192cfb1_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, cfb1, CFB, 0, 192, 8, 128, stream)
+/* lbprov_dummy_aes128cfb1_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, cfb1, CFB, 0, 128, 8, 128, stream)
+/* lbprov_dummy_aes256cfb8_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, cfb8, CFB, 0, 256, 8, 128, stream)
+/* lbprov_dummy_aes192cfb8_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, cfb8, CFB, 0, 192, 8, 128, stream)
+/* lbprov_dummy_aes128cfb8_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(aes, AES, cfb8, CFB, 0, 128, 8, 128, stream)
+
+#ifndef OPENSSL_NO_SM4
+/*
+ * SM4 dummy
+ */
+/* lbprov_dummy_sm4128ecb_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(sm4, SM4, ecb, ECB, 0, 128, 128, 0, block)
+/* lbprov_dummy_sm4128cbc_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(sm4, SM4, cbc, CBC, 0, 128, 128, 128, block)
+/* lbprov_dummy_sm4128ctr_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(sm4, SM4, ctr, CTR, 0, 128, 8, 128, stream)
+/* lbprov_dummy_sm4128ofb128_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(sm4, SM4, ofb128, OFB, 0, 128, 8, 128, stream)
+/* lbprov_dummy_sm4128cfb128_functions */
+IMPLEMENT_lbprov_dummy_cipher_func(sm4, SM4, cfb128,  CFB, 0, 128, 8, 128, stream)
+#endif
+
 static const OSSL_ALGORITHM lbprov_ciphers[] = {
+#if 0
+    /* TODO: if enable the following line ALG(.., lbprov_dummy_aes256ctr_functions)
+     * this runtime error will happen, even with default provider only.
+     *
+     * $ openssl speed -provider default -seconds 1 -bytes 100 -evp md5
+     * $ openssl speed -provider loadbalance -provider default -seconds 1 -bytes 100 -evp md5
+     *
+     * Error message:
+     *  203009B1FFFF0000:error:1C8000BC:Provider routines:ossl_prov_drbg_instantiate:error instantiating drbg:providers/implementations/rands/drbg.c:456:
+     *  203009B1FFFF0000:error:1200006C:random number generator:rand_new_drbg:error instantiating drbg:crypto/rand/rand_lib.c:612:
+     */
+    ALG(PROV_NAMES_AES_256_CTR, lbprov_dummy_aes256ctr_functions),
+#endif
+    ALG(PROV_NAMES_AES_192_CTR, lbprov_dummy_aes192ctr_functions),
+    ALG(PROV_NAMES_AES_128_CTR, lbprov_dummy_aes128ctr_functions),
+    ALG(PROV_NAMES_AES_256_ECB, lbprov_dummy_aes256ecb_functions),
+    ALG(PROV_NAMES_AES_192_ECB, lbprov_dummy_aes192ecb_functions),
+    ALG(PROV_NAMES_AES_128_ECB, lbprov_dummy_aes128ecb_functions),
+    ALG(PROV_NAMES_AES_256_CBC, lbprov_dummy_aes256cbc_functions),
+    ALG(PROV_NAMES_AES_192_CBC, lbprov_dummy_aes192cbc_functions),
+    ALG(PROV_NAMES_AES_128_CBC, lbprov_dummy_aes128cbc_functions),
+    ALG(PROV_NAMES_AES_256_OFB, lbprov_dummy_aes256ofb_functions),
+    ALG(PROV_NAMES_AES_192_OFB, lbprov_dummy_aes192ofb_functions),
+    ALG(PROV_NAMES_AES_128_OFB, lbprov_dummy_aes128ofb_functions),
+    ALG(PROV_NAMES_AES_256_CFB, lbprov_dummy_aes256cfb_functions),
+    ALG(PROV_NAMES_AES_192_CFB, lbprov_dummy_aes192cfb_functions),
+    ALG(PROV_NAMES_AES_128_CFB, lbprov_dummy_aes128cfb_functions),
+    ALG(PROV_NAMES_AES_256_CFB1, lbprov_dummy_aes256cfb1_functions),
+    ALG(PROV_NAMES_AES_192_CFB1, lbprov_dummy_aes192cfb1_functions),
+    ALG(PROV_NAMES_AES_128_CFB1, lbprov_dummy_aes128cfb1_functions),
+    ALG(PROV_NAMES_AES_256_CFB8, lbprov_dummy_aes256cfb8_functions),
+    ALG(PROV_NAMES_AES_192_CFB8, lbprov_dummy_aes192cfb8_functions),
+    ALG(PROV_NAMES_AES_128_CFB8, lbprov_dummy_aes128cfb8_functions),
+#ifndef OPENSSL_NO_SM4
+    ALG(PROV_NAMES_SM4_ECB, lbprov_dummy_sm4128ecb_functions),
+    ALG(PROV_NAMES_SM4_CBC, lbprov_dummy_sm4128cbc_functions),
+    ALG(PROV_NAMES_SM4_CTR, lbprov_dummy_sm4128ctr_functions),
+    ALG(PROV_NAMES_SM4_OFB, lbprov_dummy_sm4128ofb128_functions),
+    ALG(PROV_NAMES_SM4_CFB, lbprov_dummy_sm4128cfb128_functions),
+#endif /* OPENSSL_NO_SM4 */
     { NULL, NULL, NULL }
 };
 
